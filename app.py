@@ -3,10 +3,12 @@ import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
+import numpy as np
 import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 import io
+import os
 
 st.set_page_config(layout="wide", page_title="대한민국 증시 AI 통합 브리핑 분석기")
 st.title("📈 대한민국 증시 AI 통합 브리핑 & 실시간 차트 분석기")
@@ -138,7 +140,6 @@ def load_stock_data_yf(code, period, interval):
                 df = df.rename(columns={'Datetime': 'Date'})
             df['Date_str'] = df['Date'].dt.strftime('%Y-%m-%d %H:%M')
 
-            # 이동평균선 계산 (분봉/일봉 공통 적용, 데이터 부족 시 자동으로 NaN 처리됨)
             df['MA5'] = df['Close'].rolling(window=5).mean()
             df['MA20'] = df['Close'].rolling(window=20).mean()
             df['MA60'] = df['Close'].rolling(window=60).mean()
@@ -148,16 +149,286 @@ def load_stock_data_yf(code, period, interval):
         return pd.DataFrame()
 
 
-def render_news_cards(news_df, key_prefix=""):
-    """뉴스 리스트를 카드(expander) 형태로 출력"""
-    for idx, row in news_df.iterrows():
+def render_news_cards(news_df):
+    """뉴스 리스트를 카드(container) 형태로 출력"""
+    for _, row in news_df.iterrows():
         with st.container(border=True):
             st.markdown(f"**{row['AI 감성판단']}**  ·  {row['Date_str']}  ·  {row['언론사']}")
             st.markdown(f"🔗 [{row['제목']}]({row['링크']})")
 
 
-def build_price_chart(stock_df, stock_name, stock_code, interval):
-    """가독성을 높인 캔들스틱 + 이동평균선 + 거래량 차트 생성"""
+def _to_naive(series_or_ts):
+    """타임존 정보가 있으면 제거하여 naive datetime으로 통일"""
+    if isinstance(series_or_ts, pd.Series):
+        if hasattr(series_or_ts.dt, 'tz') and series_or_ts.dt.tz is not None:
+            return series_or_ts.dt.tz_localize(None)
+        return series_or_ts
+    ts = pd.Timestamp(series_or_ts)
+    return ts.tz_localize(None) if ts.tzinfo is not None else ts
+
+
+def match_news_to_chart(stock_df, news_df, interval):
+    """뉴스를 캔들 시간에 매칭 (분봉이면 촘촘하게, 일봉이면 하루 단위로)"""
+    if news_df.empty or stock_df.empty:
+        return pd.DataFrame()
+
+    tolerance = pd.Timedelta(hours=3) if interval != "1d" else pd.Timedelta(days=1)
+    chart_dates_naive = _to_naive(stock_df['Date'])
+
+    matched = []
+    for _, news_row in news_df.iterrows():
+        try:
+            news_dt = _to_naive(news_row['Datetime'])
+            diffs = (chart_dates_naive - news_dt).abs()
+            closest_idx = diffs.idxmin()
+            if diffs[closest_idx] <= tolerance:
+                match_row = stock_df.iloc[closest_idx].copy()
+                match_row['뉴스제목'] = news_row['제목']
+                match_row['뉴스시간'] = news_row['Date_str']
+                matched.append(match_row)
+        except Exception:
+            continue
+    return pd.DataFrame(matched)
+
+
+# =========================================================================
+# 🔮 3. 예상가 예측 + 자기보정(학습) 로직 (저장소: Google Sheets, 미설정 시 로컬 CSV 폴백)
+# =========================================================================
+LOG_PATH = os.path.join(os.path.dirname(__file__), "predictions_log.csv") if "__file__" in globals() else "predictions_log.csv"
+LOG_COLS = ['stock_code', 'stock_name', 'made_at', 'target_time', 'predicted', 'upper', 'lower', 'last_price', 'actual_price', 'resolved']
+MARKET_CLOSE_HOUR, MARKET_CLOSE_MIN = 15, 30
+GSHEET_WORKSHEET_NAME = "predictions_log"
+
+
+@st.cache_resource(show_spinner=False)
+def get_gsheet_worksheet():
+    """Streamlit secrets에 Google 서비스 계정 정보가 있으면 시트를 열어서 반환, 없으면 None"""
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+
+        if "gcp_service_account" not in st.secrets or "GSHEET_ID" not in st.secrets:
+            return None
+
+        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+        creds = Credentials.from_service_account_info(dict(st.secrets["gcp_service_account"]), scopes=scopes)
+        client = gspread.authorize(creds)
+        sh = client.open_by_key(st.secrets["GSHEET_ID"])
+
+        try:
+            worksheet = sh.worksheet(GSHEET_WORKSHEET_NAME)
+        except gspread.exceptions.WorksheetNotFound:
+            worksheet = sh.add_worksheet(title=GSHEET_WORKSHEET_NAME, rows=2000, cols=len(LOG_COLS))
+            worksheet.append_row(LOG_COLS)
+        return worksheet
+    except Exception:
+        return None
+
+
+def is_gsheet_connected():
+    return get_gsheet_worksheet() is not None
+
+
+def load_log():
+    ws = get_gsheet_worksheet()
+    if ws is not None:
+        try:
+            records = ws.get_all_records()
+            df = pd.DataFrame(records) if records else pd.DataFrame(columns=LOG_COLS)
+            for c in LOG_COLS:
+                if c not in df.columns:
+                    df[c] = None
+            df['made_at'] = pd.to_datetime(df['made_at'], errors='coerce')
+            df['target_time'] = pd.to_datetime(df['target_time'], errors='coerce')
+            df['resolved'] = df['resolved'].astype(str).str.lower().isin(['true', '1'])
+            for c in ['predicted', 'upper', 'lower', 'last_price', 'actual_price']:
+                df[c] = pd.to_numeric(df[c], errors='coerce')
+            return df
+        except Exception:
+            pass  # Sheets 읽기 실패 시 아래 CSV 폴백으로 진행
+
+    if os.path.exists(LOG_PATH):
+        try:
+            df = pd.read_csv(LOG_PATH, parse_dates=['made_at', 'target_time'])
+            for c in LOG_COLS:
+                if c not in df.columns:
+                    df[c] = None
+            return df
+        except Exception:
+            return pd.DataFrame(columns=LOG_COLS)
+    return pd.DataFrame(columns=LOG_COLS)
+
+
+def save_log(df):
+    ws = get_gsheet_worksheet()
+    if ws is not None:
+        try:
+            df_out = df.copy()
+            df_out['made_at'] = df_out['made_at'].astype(str)
+            df_out['target_time'] = df_out['target_time'].astype(str)
+            df_out = df_out[LOG_COLS].fillna('')
+            ws.clear()
+            ws.update([LOG_COLS] + df_out.astype(str).values.tolist())
+            return
+        except Exception:
+            pass  # Sheets 쓰기 실패 시 아래 CSV 폴백으로 진행
+
+    try:
+        df.to_csv(LOG_PATH, index=False)
+    except Exception:
+        pass
+
+
+def generate_prediction(stock_df, view_type):
+    """최근 가격 추세를 선형회귀로 연장하여 예상가 계산"""
+    df = stock_df.dropna(subset=['Close']).reset_index(drop=True)
+    if len(df) < 5:
+        return None
+
+    lookback = min(30, len(df))
+    recent = df.tail(lookback).reset_index(drop=True)
+    x = np.arange(len(recent))
+    y = recent['Close'].values
+    slope, intercept = np.polyfit(x, y, 1)
+    fitted = slope * x + intercept
+    resid_std = float(np.std(y - fitted)) if len(y) > 2 else 0.0
+
+    last_time = df['Date'].iloc[-1]
+    last_idx = len(recent) - 1
+    last_price = float(df['Close'].iloc[-1])
+
+    if view_type == "일 단위 (Daily)":
+        target_time = last_time + timedelta(days=1)
+        steps_ahead = 1
+        label = "다음 거래일 예상 종가 (근사치)"
+    else:
+        now = datetime.now()
+        market_close = last_time.replace(hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MIN, second=0, microsecond=0)
+        if last_time.date() != now.date() or last_time >= market_close:
+            return None  # 오늘 장중 데이터가 아니거나 이미 장마감이면 예측 생략
+        if len(recent) >= 2:
+            interval_minutes = max((recent['Date'].iloc[-1] - recent['Date'].iloc[-2]).total_seconds() / 60, 1)
+        else:
+            interval_minutes = 1
+        remaining_minutes = (market_close - last_time).total_seconds() / 60
+        steps_ahead = max(1, int(remaining_minutes / interval_minutes))
+        target_time = market_close
+        label = "오늘 장마감 예상가"
+
+    predicted = float(slope * (last_idx + steps_ahead) + intercept)
+    upper = predicted + 1.96 * resid_std
+    lower = predicted - 1.96 * resid_std
+
+    return {
+        'predicted': predicted, 'upper': upper, 'lower': lower,
+        'target_time': target_time, 'label': label,
+        'last_time': last_time, 'last_price': last_price, 'slope': slope
+    }
+
+
+def get_calibration_bias(stock_code):
+    """과거 예측이 실제와 얼마나 차이났는지(오차) 평균내어 보정값으로 사용 -> 간단한 자기학습"""
+    log_df = load_log()
+    if log_df.empty:
+        return 0.0, 0
+    resolved = log_df[(log_df['stock_code'] == stock_code) & (log_df['resolved'] == True)]
+    if resolved.empty:
+        return 0.0, 0
+    resolved = resolved.tail(10)
+    try:
+        errors = resolved['actual_price'].astype(float) - resolved['predicted'].astype(float)
+        return float(errors.mean()), len(resolved)
+    except Exception:
+        return 0.0, 0
+
+
+def log_prediction(stock_code, stock_name, pred_info):
+    """오늘 이미 기록했으면 중복 저장하지 않음"""
+    log_df = load_log()
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    if not log_df.empty:
+        made_at_str = log_df['made_at'].astype(str).str[:10]
+        mask = (log_df['stock_code'] == stock_code) & (made_at_str == today_str) & \
+               (log_df['target_time'].astype(str).str[:10] == str(pred_info['target_time'])[:10])
+        if mask.any():
+            return
+    new_row = {
+        'stock_code': stock_code, 'stock_name': stock_name,
+        'made_at': datetime.now(), 'target_time': pred_info['target_time'],
+        'predicted': pred_info['predicted'], 'upper': pred_info['upper'], 'lower': pred_info['lower'],
+        'last_price': pred_info['last_price'], 'actual_price': None, 'resolved': False
+    }
+    log_df = pd.concat([log_df, pd.DataFrame([new_row])], ignore_index=True)
+    save_log(log_df)
+
+
+def resolve_pending_predictions(stock_code):
+    """대상 시각이 지난 예측에 대해 실제가를 조회하여 오차를 기록 (학습 데이터 축적)"""
+    log_df = load_log()
+    if log_df.empty:
+        return log_df
+    now = pd.Timestamp.now()
+    pending_mask = (log_df['stock_code'] == stock_code) & (log_df['resolved'] != True)
+    pending = log_df[pending_mask]
+    if pending.empty:
+        return log_df
+
+    actual_hist = None
+    for idx, row in pending.iterrows():
+        try:
+            target_time = pd.to_datetime(row['target_time'])
+        except Exception:
+            continue
+        if target_time > now:
+            continue
+        if actual_hist is None:
+            try:
+                hist = yf.download(f"{stock_code}.KS", period="7d", interval="15m", progress=False)
+                if hist is None or hist.empty:
+                    hist = yf.download(f"{stock_code}.KQ", period="7d", interval="15m", progress=False)
+                if hist is not None and not hist.empty:
+                    hist = hist.reset_index()
+                    if isinstance(hist.columns, pd.MultiIndex):
+                        hist.columns = [c[0] for c in hist.columns]
+                    time_col = 'Datetime' if 'Datetime' in hist.columns else 'Date'
+                    hist = hist.rename(columns={time_col: 'Date'})
+                    hist['Date'] = _to_naive(pd.to_datetime(hist['Date']))
+                    actual_hist = hist
+                else:
+                    actual_hist = pd.DataFrame()
+            except Exception:
+                actual_hist = pd.DataFrame()
+
+        if actual_hist is not None and not actual_hist.empty:
+            target_time_naive = _to_naive(target_time)
+            diffs = (actual_hist['Date'] - target_time_naive).abs()
+            nearest_idx = diffs.idxmin()
+            if diffs[nearest_idx] <= pd.Timedelta(hours=6):
+                actual_price = float(actual_hist.loc[nearest_idx, 'Close'])
+                log_df.loc[idx, 'actual_price'] = actual_price
+                log_df.loc[idx, 'resolved'] = True
+
+    save_log(log_df)
+    return log_df
+
+
+def add_prediction_to_chart(fig, pred_info):
+    fig.add_trace(go.Scatter(
+        x=[pred_info['last_time'], pred_info['target_time']],
+        y=[pred_info['last_price'], pred_info['predicted']],
+        mode='lines+markers', line=dict(dash='dash', color='#e67e22', width=2),
+        marker=dict(size=9, symbol='star'), name='🔮 AI 예상 추세선'
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=[pred_info['target_time'], pred_info['target_time']],
+        y=[pred_info['lower'], pred_info['upper']],
+        mode='lines', line=dict(color='rgba(230,126,34,0.5)', width=7),
+        name='예상 범위(신뢰구간)'
+    ), row=1, col=1)
+    return fig
+
+
+def build_price_chart(stock_df, stock_name, stock_code, interval, matched_news_df=None, pred_info=None):
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True,
         row_heights=[0.75, 0.25], vertical_spacing=0.03,
@@ -177,6 +448,19 @@ def build_price_chart(stock_df, stock_name, stock_code, interval):
                 line=dict(width=1.4, color=color), name=ma_col
             ), row=1, col=1)
 
+    # 뉴스 마커 (시간/분 단위로 정확히 매칭)
+    if matched_news_df is not None and not matched_news_df.empty:
+        fig.add_trace(go.Scatter(
+            x=matched_news_df['Date'], y=matched_news_df['High'] * 1.01,
+            mode='markers', marker=dict(symbol='triangle-down', size=12, color='gold', line=dict(width=1, color='#333')),
+            hovertemplate="<b>📰 %{customdata[0]}</b><br>%{customdata[1]}<extra></extra>",
+            customdata=matched_news_df[['뉴스제목', '뉴스시간']].values,
+            name='관련 뉴스'
+        ), row=1, col=1)
+
+    if pred_info is not None:
+        add_prediction_to_chart(fig, pred_info)
+
     if 'Volume' in stock_df.columns:
         vol_colors = ['#d64550' if c >= o else '#3b82f6' for o, c in zip(stock_df['Open'], stock_df['Close'])]
         fig.add_trace(go.Bar(
@@ -185,7 +469,7 @@ def build_price_chart(stock_df, stock_name, stock_code, interval):
         ), row=2, col=1)
 
     fig.update_layout(
-        template='plotly_white', height=650,
+        template='plotly_white', height=680,
         xaxis_rangeslider_visible=False,
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
         margin=dict(t=60, b=20, l=10, r=10),
@@ -196,7 +480,7 @@ def build_price_chart(stock_df, stock_name, stock_code, interval):
 
 
 # 📌 탭 설정
-tab1, tab2 = st.tabs(["📰 오늘의 한국 경제 시황 (기본 화면)", "📊 개별 종목 상세 분석 (일봉/분봉 + AI 뉴스 분석)"])
+tab1, tab2 = st.tabs(["📰 오늘의 한국 경제 시황 (기본 화면)", "📊 개별 종목 상세 분석 (예상가 · 뉴스 매핑 · AI 분석)"])
 
 # =========================================================================
 # [기본 화면] TAB 1
@@ -237,11 +521,16 @@ with tab1:
             st.error("실시간 경제 뉴스를 불러오는데 실패했습니다. 잠시 후 새로고침 해주세요.")
 
 # =========================================================================
-# [선택 화면] TAB 2: 개별 종목 상세 분석 + 종목별 뉴스 AI 분석
+# [선택 화면] TAB 2: 개별 종목 상세 분석 + 예상가 + 종목별 뉴스 AI 분석
 # =========================================================================
 with tab2:
-    st.subheader("🔍 개별 종목 주가 차트 & 종목 전용 AI 뉴스 분석")
+    st.subheader("🔍 개별 종목 주가 차트 · 오늘 예상가 · 종목 전용 AI 뉴스 분석")
     st.sidebar.header("⚙️ 종목 및 차트 조건 설정")
+
+    if is_gsheet_connected():
+        st.sidebar.success("🟢 학습 데이터: Google Sheets 연동됨")
+    else:
+        st.sidebar.warning("🟡 학습 데이터: 로컬 CSV 사용 중 (Sheets 미연동)")
 
     with st.spinner("한국거래소(KRX) 전체 상장사 목록을 불러오는 중..."):
         krx_dict = load_krx_stock_list()
@@ -285,13 +574,62 @@ with tab2:
         c2.metric("최고가 (조회기간)", f"{stock_df['High'].max():,.0f}원")
         c3.metric("최저가 (조회기간)", f"{stock_df['Low'].min():,.0f}원")
 
-        st.markdown(f"#### 📊 {stock_name}({stock_code}) 실시간 차트 ({interval})")
-        fig = build_price_chart(stock_df, stock_name, stock_code, interval)
+        # --- 🔮 오늘 예상가 (자기보정 학습 적용) ---
+        resolve_pending_predictions(stock_code)  # 지나간 예측들 실제값과 비교하여 학습 데이터 축적
+        pred_info = generate_prediction(stock_df, view_type)
+        bias, n_samples = get_calibration_bias(stock_code)
+
+        if pred_info is not None:
+            calibrated = n_samples >= 3
+            if calibrated:
+                pred_info['predicted'] += bias
+                pred_info['upper'] += bias
+                pred_info['lower'] += bias
+
+            log_prediction(stock_code, stock_name, pred_info)
+
+            st.markdown("#### 🔮 AI 예상가")
+            p1, p2, p3 = st.columns(3)
+            p1.metric(pred_info['label'], f"{pred_info['predicted']:,.0f}원",
+                      f"{pred_info['predicted'] - pred_info['last_price']:,.0f}원")
+            p2.metric("예상 상단", f"{pred_info['upper']:,.0f}원")
+            p3.metric("예상 하단", f"{pred_info['lower']:,.0f}원")
+
+            cal_msg = f"과거 예측 {n_samples}건의 오차(평균 {bias:,.0f}원)를 반영해 보정된 값입니다." if calibrated \
+                else f"아직 학습 데이터가 부족합니다 (누적 {n_samples}건, 3건 이상부터 자동 보정 적용)."
+            st.caption(f"📌 {cal_msg} 최근 가격 추세를 선형회귀로 연장한 통계적 추정치이며, **투자 조언이 아닙니다.**")
+        else:
+            st.info("💡 현재 조회 조건에서는 예상가를 계산할 수 없습니다 (장중 데이터가 아니거나 데이터가 부족합니다). 분 단위 차트를 오늘 날짜로 선택하면 오늘 장마감 예상가를 볼 수 있어요.")
+
+        st.markdown(f"#### 📊 {stock_name}({stock_code}) 실시간 차트 ({interval}) — 뉴스 마커 & 예상가 포함")
+        matched_news_df = match_news_to_chart(stock_df, stock_news_df, interval)
+        fig = build_price_chart(stock_df, stock_name, stock_code, interval, matched_news_df, pred_info)
         st.plotly_chart(fig, use_container_width=True)
+        if not matched_news_df.empty:
+            st.caption(f"🔶 차트 위의 금색 삼각형 마커 = 해당 시간대에 매칭된 뉴스 (총 {len(matched_news_df)}건). 마우스를 올리면 제목이 보여요.")
+
+        # --- 📊 예측 정확도(학습 이력) ---
+        with st.expander("📊 이 종목의 과거 예측 정확도 확인 (학습 데이터)"):
+            log_df = load_log()
+            stock_log = log_df[log_df['stock_code'] == stock_code].copy() if not log_df.empty else pd.DataFrame()
+            if stock_log.empty:
+                st.write("아직 축적된 예측 기록이 없습니다. 시간이 지나면 여기에 예측 대비 실제 결과가 쌓입니다.")
+            else:
+                stock_log['오차(원)'] = stock_log.apply(
+                    lambda r: (r['actual_price'] - r['predicted']) if pd.notna(r.get('actual_price')) else None, axis=1)
+                stock_log['오차율(%)'] = stock_log.apply(
+                    lambda r: (r['오차(원)'] / r['predicted'] * 100) if pd.notna(r.get('오차(원)')) and r['predicted'] else None, axis=1)
+                display_cols = ['made_at', 'target_time', 'last_price', 'predicted', 'actual_price', '오차(원)', '오차율(%)', 'resolved']
+                st.dataframe(stock_log[display_cols].sort_values('made_at', ascending=False), use_container_width=True)
+
+                resolved_only = stock_log[stock_log['resolved'] == True]
+                if not resolved_only.empty:
+                    mape = resolved_only['오차율(%)'].abs().mean()
+                    st.metric("평균 절대 오차율 (MAPE)", f"{mape:.2f}%")
 
         st.markdown("---")
 
-        # --- ⭐ 종목별 뉴스 + AI 분석 (핵심 신규 기능) ---
+        # --- ⭐ 종목별 뉴스 + AI 분석 ---
         news_col, ai_col = st.columns([5, 5])
 
         with news_col:

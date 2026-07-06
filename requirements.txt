@@ -2,6 +2,9 @@ streamlit
 yfinance
 plotly
 pandas
+numpy
 requests
 google-generativeai
 lxml
+gspread
+google-auth
