@@ -7,20 +7,21 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
 st.set_page_config(layout="wide", page_title="대한민국 증시 AI 통합 브리핑 분석기")
-st.title("经济 📈 대한민국 증시 AI 통합 브리핑 & 실시간 차트 분석기")
+st.title("📈 대한민국 증시 AI 통합 브리핑 & 실시간 차트 분석기")
 
-# 구글 AI 세팅
+# 🛠️ 구글 AI 세팅 (최신 모델 엔진으로 교체 완료)
 try:
     import google.generativeai as genai
     api_key = st.secrets["GEMINI_API_KEY"]
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    # 에러가 나던 기존 1.5 대신 최신 표준인 gemini-2.0-flash를 사용합니다.
+    model = genai.GenerativeModel('gemini-2.0-flash')
     ai_ready = True
 except Exception as e:
     ai_ready = False
     ai_error_msg = str(e)
 
-# 📡 1. 뉴스 수집 및 시간/분 파싱 함수 (KST 대한민국 시간 보정 적용)
+# 📡 1. 뉴스 수집 및 시간/분 파싱 함수
 def fetch_google_news(query, max_results=20):
     url = f"https://news.google.com/rss/search?q={query}&hl=ko&gl=KR&ceid=KR:ko"
     try:
@@ -39,7 +40,7 @@ def fetch_google_news(query, max_results=20):
             # 뉴스 발행 시간 분 단위까지 파싱 (GMT -> KST +9시간 보정)
             try:
                 dt = datetime.strptime(pub_date, '%a, %d %b %Y %H:%M:%S %Z')
-                dt = dt + timedelta(hours=9) # 한국 시간으로 변경
+                dt = dt + timedelta(hours=9) 
                 date_str = dt.strftime('%Y-%m-%d %H:%M')
             except:
                 try:
@@ -62,42 +63,34 @@ def fetch_google_news(query, max_results=20):
     except Exception as e:
         return pd.DataFrame()
 
-# 📡 2. 주가 데이터 수집 함수 (yfinance 엔진으로 교체 - 분봉 완벽 지원)
+# 📡 2. 주가 데이터 수집 함수 (yfinance 엔진)
 def load_stock_data_yf(code, period, interval):
     try:
         clean_code = str(code).strip()
-        # yfinance용 한국 시장 접미사 처리 (종목코드가 숫자인 경우만)
         if clean_code.isdigit():
-            # 코스피/코스닥 구분을 위해 두 군데 다 찔러봄 (우선순위 .KS -> .KQ)
             for suffix in ['.KS', '.KQ']:
                 ticker = clean_code + suffix
                 df = yf.download(ticker, period=period, interval=interval, progress=False)
                 if df is not None and not df.empty:
                     break
         else:
-            # 주식명이 들어왔을 때를 대비한 안전 장치
             df = yf.download(clean_code, period=period, interval=interval, progress=False)
             
         if df is not None and not df.empty:
             df = df.reset_index()
-            # 다중 인덱스 컬럼 깨기
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = [col[0] for col in df.columns]
             
-            # 날짜 컬럼 이름 통일 (Datetime 혹은 Date)
             if 'Datetime' in df.columns:
                 df = df.rename(columns={'Datetime': 'Date'})
-            elif 'Date' in df.columns:
-                pass
                 
-            # 시각화용 시간 문자열 생성
             df['Date_str'] = df['Date'].dt.strftime('%Y-%m-%d %H:%M')
             return df
         return pd.DataFrame()
     except:
         return pd.DataFrame()
 
-# 📌 탭 분할: 기본 화면을 '오늘의 한국 경제 시황'으로 고정
+# 📌 탭 설정
 tab1, tab2 = st.tabs(["📰 오늘의 한국 경제 시황 (기본 화면)", "📊 개별 종목 상세 분석 (일봉/분봉)"])
 
 # =========================================================================
@@ -141,13 +134,11 @@ with tab1:
 with tab2:
     st.subheader("🔍 개별 종목 주가 차트 & 관련 뉴스 분석")
     
-    # 사이드바 설정 영역
     st.sidebar.header("⚙️ 종목 및 차트 조건 설정")
     stock_dict = {"삼성전자": "005930", "SK하이닉스": "000660", "현대차": "005380", "NAVER": "035420", "카카오": "035720"}
     selected_name = st.sidebar.selectbox("추천 종목 선택", list(stock_dict.keys()))
     custom_code = st.sidebar.text_input("또는 다른 종목코드 6자리 입력 (예: 차바이오텍 010950)", value="")
 
-    # 종목 코드 및 검색어 정제
     if custom_code.strip():
         stock_code = custom_code.strip()
         stock_name = stock_code  
@@ -155,7 +146,6 @@ with tab2:
         stock_code = stock_dict[selected_name]
         stock_name = selected_name
 
-    # ⏱️ 조회 기준일수 및 분 단위 설정 UI 추가
     st.sidebar.markdown("---")
     view_type = st.sidebar.radio("⏱️ 차트 조회 기준 선택", ["일 단위 (Daily)", "분 단위 (Minute)"])
     
@@ -175,35 +165,28 @@ with tab2:
             period = "5d"
             interval = "15m"
 
-    # 데이터 수집 실행
-    with st.spinner(f'종목 데이터를 실시간으로 수집하는 중...'):
+    with St.spinner(f'종목 데이터를 실시간으로 수집하는 중...'):
         stock_df = load_stock_data_yf(stock_code, period, interval)
-        # 구글 뉴스에서 종목 관련 뉴스 검색
         stock_news_df = fetch_google_news(stock_name, max_results=15)
         
-    # 화면 그리기
     if not stock_df.empty:
         col1, col2 = st.columns([6, 4])
         with col1:
             display_title = selected_name if not custom_code.strip() else f"입력 종목 [{stock_code}]"
             st.markdown(f"#### 📊 {display_title} 실시간 차트 ({interval})")
             
-            # 캔들스틱 차트 생성
             fig = go.Figure(data=[go.Candlestick(
                 x=stock_df['Date'], open=stock_df['Open'], high=stock_df['High'],
                 low=stock_df['Low'], close=stock_df['Close'], name='주가'
             )])
             
-            # 📌 차트 에러 수정 완료: 'balloon' 대신 지원 가능한 기호 'triangle-up' 사용 및 시간 매칭 로직 보강
             if not stock_news_df.empty:
                 chart_news_list = []
                 for _, news_row in stock_news_df.iterrows():
                     try:
-                        # 뉴스가 터진 시각과 가장 가까운 주가 데이터 포인트 매칭
                         news_dt = pd.to_datetime(news_row['Date_str'])
                         time_diffs = (stock_df['Date'] - news_dt).abs()
                         closest_idx = time_diffs.idxmin()
-                        # 하루 미만의 오차 범위 내인 경우에만 차트 마커로 표시
                         if time_diffs[closest_idx] < pd.Timedelta(days=1):
                             match_row = stock_df.iloc[closest_idx].copy()
                             match_row['뉴스제목'] = news_row['제목']
