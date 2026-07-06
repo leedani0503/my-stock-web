@@ -56,7 +56,7 @@ def fetch_google_news(query, max_results=20):
                 '제목': title.split(' - ')[0] if ' - ' in title else title,
                 '언론사': title.split(' - ')[1] if ' - ' in title else '경제뉴스',
                 'AI 감성판단': sentiment, 
-                '링크': link
+                '링크': link  # 여기서 '링크'로 저장됨
             })
         return pd.DataFrame(news_list)
     except Exception as e:
@@ -114,20 +114,20 @@ with tab1:
                     st.markdown("### 🤖 전문 AI의 시장 종합 요약 리포트")
                     st.info(response.text) 
                 except Exception as ai_err:
-                    # 📌 구글 429 무료 제한 에러 우아하게 처리하기
                     err_msg = str(ai_err).lower()
                     if "quota" in err_msg or "429" in err_msg:
-                        st.warning("⚠️ **구글 AI 무료 버전의 호출 제한(Quota Exceeded)에 도달했습니다.**\n\n무료 API 키는 분당/일일 요청 횟수가 제한되어 있어, 새로고침을 자주 하거나 사용자가 일시적으로 몰리면 작동이 잠시 멈춥니다. **약 1~2분 뒤에 페이지를 다시 새로고침(F5)** 해보세요!\n\n*(AI 요약은 잠시 쉬어가지만, 아래 실시간 뉴스는 정상적으로 보실 수 있습니다.)*")
+                        st.warning("⚠️ **구글 AI 무료 버전의 호출 제한에 도달했습니다.**\n\n무료 API 키는 분당/일일 요청 횟수가 엄격히 제한되어 있어, 새로고침을 연속으로 하시면 일시적으로 멈춥니다. **약 1분 뒤에 페이지를 다시 새로고침** 해보세요!\n\n*(AI 요약은 잠시 제한되지만, 아래 실시간 뉴스는 정상적으로 보실 수 있습니다.)*")
                     else:
                         st.warning(f"⚠️ AI 요약 생성 중 오류가 발생했습니다. (원인: {str(ai_err)})")
             else:
-                st.warning(f"⚠️ AI 엔진이 준비되지 않았습니다. Secrets 설정을 확인하세요. (에러내용: {ai_error_msg if 'ai_error_msg' in locals() else 'Key 없음'})")
+                st.warning(f"⚠️ AI 엔진이 준비되지 않았습니다. Secrets 설정을 확인하세요.")
                 
             st.write("")
             st.subheader("📰 실시간 주요 경제 뉴스 헤드라인 (분 단위 표시)")
             for _, row in economy_news_df.iterrows():
                 st.markdown(f"**[{row['AI 감성판단']}]** {row['Date_str']} | {row['언론사']}")
-                st.markdown(f"🔗 [{row['제목']}]({row['LINK']})")
+                # 📌 오타 수정 완료: 'LINK' -> '링크'
+                st.markdown(f"🔗 [{row['제목']}]({row['링크']})")
                 st.markdown("---")
         else:
             st.error("실시간 경제 뉴스를 불러오는데 실패했습니다. 잠시 후 새로고침 해주세요.")
@@ -169,7 +169,6 @@ with tab2:
             period = "5d"
             interval = "15m"
 
-    # 📌 대문자 St.spinner를 소문자 st.spinner로 완벽 수정!
     with st.spinner(f'종목 데이터를 실시간으로 수집하는 중...'):
         stock_df = load_stock_data_yf(stock_code, period, interval)
         stock_news_df = fetch_google_news(stock_name, max_results=15)
@@ -216,6 +215,7 @@ with tab2:
             if not stock_news_df.empty:
                 for _, row in stock_news_df.iterrows():
                     st.markdown(f"**[{row['AI 감성판단']}]** {row['Date_str']} | {row['언론사']}")
+                    # 📌 여기도 혹시 모를 오타 방지를 위해 '링크'로 완벽 지정
                     st.markdown(f"🔗 [{row['제목']}]({row['링크']})")
                     st.markdown("---")
             else:
