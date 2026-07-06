@@ -4,3 +4,4 @@ plotly
 pandas
 requests
 google-generativeai
+lxml
